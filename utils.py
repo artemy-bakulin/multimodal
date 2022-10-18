@@ -6,6 +6,7 @@ from scipy import sparse
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import inspect
+from torch.utils.data import DataLoader
 
 
 # https://d2l.ai/_modules/d2l/torch.html
@@ -26,71 +27,7 @@ class HyperParameters:
             setattr(self, k, v)
       
             
-class DataLoader(torch.utils.data.DataLoader):
 
-    def __init__(self, train_inputs, train_targets, train_idx=None, 
-                 *,
-                batch_size=512, shuffle=False, drop_last=False, device='cuda'):
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.drop_last = drop_last
-        self.device = device
-        
-        self.train_inputs = train_inputs
-        self.dataset = np.arange(self.train_inputs.shape[0] // batch_size * batch_size) ### very dumb crutch to use with 
-        self.train_targets = train_targets
-        self.n_input_features = train_inputs.shape[1]
-        self.n_target_features = train_targets.shape[1]
-        
-        if self.train_inputs.shape[0] < 512 * 4 and False:
-            self.data_in_memory = True
-            self.train_inputs = torch.from_numpy(self.train_inputs.todense()).to(self.device)
-            self.train_targets = torch.from_numpy(self.train_targets.todense()).to(self.device)
-        else:
-            self.data_in_memory = False
-        
-        self.train_idx = train_idx
-        
-        self.nb_examples = len(self.train_idx) if self.train_idx is not None else train_inputs.shape[0]
-        
-        self.nb_batches = self.nb_examples // batch_size
-        if not drop_last and not self.nb_examples%batch_size==0:
-            self.nb_batches +=1
-        
-    def __iter__(self):
-        if self.data_in_memory:
-            return self.train_inputs, self.train_targets
-        
-        if self.shuffle:
-            shuffled_idx = torch.randperm(self.nb_examples)
-            if self.train_idx is not None:
-                idx_array = self.train_idx[shuffled_idx]
-            else:
-                idx_array = shuffled_idx
-        else:
-            if self.train_idx is not None:
-                idx_array = self.train_idx
-            else:
-                idx_array = None
-            
-        for i in range(self.nb_batches):
-            slc = slice(i*self.batch_size, (i+1)*self.batch_size)
-            if idx_array is None:
-                inp_batch = self.train_inputs[i*self.batch_size: (i+1)*self.batch_size]
-                tgt_batch = self.train_targets[i*self.batch_size: (i+1)*self.batch_size]
-            else:
-                idx_batch = idx_array[slc]
-                inp_batch = self.train_inputs[idx_batch]
-                tgt_batch = self.train_targets[idx_batch]
-                
-            inp_batch = torch.from_numpy(inp_batch.todense()).to(self.device)
-            tgt_batch = torch.from_numpy(tgt_batch.todense()).to(self.device)
-            yield inp_batch, tgt_batch
-            
-            
-    def __len__(self):
-        return self.nb_batches
-    
     
 def spearman_cor(y_true, y_pred):
     """Compute the correlation between each rows of the y_true and y_pred tensors.
@@ -144,7 +81,7 @@ def plot_progress(trainer):
         ax3.legend()
     plt.show()
 
-def plot_model_analysis(atac_pred, rna_pred, atac_orig, rna_orig):
+def plot_model_analysis(rna_pred, rna_orig):
     
     fig, axs = plt.subplots(2, 2, figsize=(10, 10))
     
@@ -182,21 +119,21 @@ def plot_model_analysis(atac_pred, rna_pred, atac_orig, rna_orig):
     plt.colorbar(label='Mean expression')
     plt.show()
     
-    plt.scatter(atac_orig.var(0), atac_pred.var(0),
-                alpha=0.1, c=atac_orig.mean(0))
-    plt.xlabel('Orig variance')
-    plt.ylabel('Pred variance')
-    plt.title('Compare ATAC variance between predictions and original')
-    plt.colorbar(label='Mean expression')
-    plt.show()
+    #plt.scatter(atac_orig.var(0), atac_pred.var(0),
+    #            alpha=0.1, c=atac_orig.mean(0))
+    #plt.xlabel('Orig variance')
+    #plt.ylabel('Pred variance')
+    #plt.title('Compare ATAC variance between predictions and original')
+    #plt.colorbar(label='Mean expression')
+    #plt.show()
     
     fig, axs = plt.subplots(1, 2, figsize=(10, 5))
-    means = []
-    means += [(atac_orig == 0).sum(1).mean()]
-    means += [(atac_pred == 0).sum(1).mean()]
-    axs[0].bar([0, 1], means, tick_label=['orig', 'pred'])
-    axs[0].set_title('Zeros in ATAC data')
-    axs[0].set_ylabel('Zeros in sample')
+    #means = []
+    #means += [(atac_orig == 0).sum(1).mean()]
+    #means += [(atac_pred == 0).sum(1).mean()]
+    #axs[0].bar([0, 1], means, tick_label=['orig', 'pred'])
+    #axs[0].set_title('Zeros in ATAC data')
+    #axs[0].set_ylabel('Zeros in sample')
 
     means = []
     means += [(rna_orig == 0).sum(1).mean()]
@@ -212,29 +149,28 @@ class Trainer(HyperParameters):
                  atac_w: float = 0.5,
                  lr: float = 0.01, 
                  max_epochs: int = 1000,
-                 wd: float = 10e-2,
-                 batch_size: int = 2048, 
+                 wd: float = 1e-2,
                  use_schedule: bool = True,
                  inputs_fn: str = None,
                  targets_fn: str = None,
                  device: str = 'cuda',
-                 writer = None
+                 writer = None,
+                 l1_weight = 0,
+                 l2_weight = 0,
+                 max_schedule_epoch = None
                  ):
         self.save_hyperparameters()
         self.use_tensor_board = True if writer is not None else False
+        self.max_schedule_epoch = self.max_epochs if self.max_schedule_epoch is None else self.max_schedule_epoch
 
-        
-    def prepare_model(self, model):
-        model = model(self.train_loader.n_input_features,
-              self.train_loader.n_target_features,
-              **self.model_params
-              )
-        model.to(self.device)
-        return model
     
     def calculate_l1_norm(self):
         l1_norm = sum([torch.abs(p).sum() for p in self.model.parameters()])
         return l1_norm
+    
+    def calculate_l2_norm(self):
+        l2_norm = sum([torch.pow(p, 2).sum() for p in self.model.parameters()])
+        return l2_norm
     
     def configure_optimizers(self):
         return torch.optim.AdamW(self.model.parameters(), self.lr, weight_decay=self.wd)
@@ -243,13 +179,31 @@ class Trainer(HyperParameters):
         return torch.optim.lr_scheduler.OneCycleLR(self.optim, 
                                                     max_lr=self.lr,
                                                     steps_per_epoch=self.steps_per_epoch,
-                                                    epochs=self.max_epochs)
+                                                    epochs=self.max_schedule_epoch)
 
-    def fit(self, model, model_params={}, do_validation=True, calculate_cor=True, subset_train=-1):
-        self.train_loader, self.val_loader = self.load_data('train', subset_train=subset_train, batch_size=self.batch_size)
-        self.steps_per_epoch = self.train_loader.nb_batches
+    def add_model(self, model, model_params={}):
+        self.model_template = model
         self.model_params = model_params
-        self.model = self.prepare_model(model)
+    
+    def prepare_model(self):
+        self.model = self.model_template(**self.model_params)
+        self.model.to(self.device)
+        
+    def reset_model(self):
+        self.model = self.model_template(**self.model_params)
+        self.model.to(self.device)
+        
+    def add_train_loader(self, train_loader):
+        self.train_loader = train_loader
+        
+    def add_val_loader(self, val_loader):
+        self.val_loader = val_loader
+    
+    def fit(self, do_validation=True, calculate_cor=True, subset_train=-1):
+        self.steps_per_epoch = self.train_loader.nb_batches
+        self.model_params['input_dim'] = self.train_loader.input_dim
+        self.model_params['output_dim'] = self.train_loader.output_dim
+        self.prepare_model()
         self.optim = self.configure_optimizers()
         if self.use_schedule:
             self.scheduler = self.configure_scheduler()
@@ -258,49 +212,50 @@ class Trainer(HyperParameters):
             print('Using TensorBoard for output')
         self.do_validation = do_validation
         self.calculate_cor = calculate_cor
-        self.train_progress = {'1mod': [], '2mod': [], '2mod_cor': []}
-        self.val_progress = {'1mod': [], '2mod': [], '2mod_cor': []}
+        self.train_progress = {'2mod': [], '2mod_cor': []}
+        self.val_progress = {'2mod': [], '2mod_cor': []}
+        #self.reduce_lr_on_plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optim)
         for self.epoch in tqdm(range(self.max_epochs)):
             self.train_batch_idx = 0
             self.val_batch_idx = 0
             self.fit_epoch()
             self.epoch += 1 
-        print('Training loss: %.2f' % np.mean(self.train_progress['2mod'][-1]),
-              'Training cor: %.2f' % np.mean(self.train_progress['2mod_cor'][-1]),
-              'Validation loss: %.2f' % np.mean(self.val_progress['2mod'][-1]),
-              'Validation cor: %.2f' % np.mean(self.val_progress['2mod_cor'][-1]), sep='\n')
+            #self.reduce_lr_on_plateau_scheduler.step(np.mean(self.val_progress['2mod'][-1]))
+        print('Training loss: %.3f' % np.mean(self.train_progress['2mod'][-1]),
+              'Training cor: %.3f' % np.mean(self.train_progress['2mod_cor'][-1]),
+              'Validation loss: %.3f' % np.mean(self.val_progress['2mod'][-1]),
+              'Validation cor: %.3f' % np.mean(self.val_progress['2mod_cor'][-1]), sep='\n')
             
     def fit_epoch(self, calculate_cor=True):
         self.model.train()
-        self.train_progress['1mod'].append([])
         self.train_progress['2mod'].append([])
         self.train_progress['2mod_cor'].append([])
         for batch_inputs, batch_targets in self.train_loader:
+            batch_inputs, batch_targets = batch_inputs.to(self.device), batch_targets.to(self.device)
             loss_atac, loss_rna, cor = self.model.training_step(batch_inputs, batch_targets, calculate_cor)
-            loss = self.atac_w * loss_atac + (1-self.atac_w) * loss_rna # + self.calculate_l1_norm()
+            loss = loss_rna + self.calculate_l1_norm() * self.l1_weight  + self.calculate_l2_norm() * self.l2_weight
             self.optim.zero_grad()
             loss.backward()
-            self.optim.step()            
-            if self.use_schedule:
+            self.optim.step()
+            if self.use_schedule and self.epoch < self.max_schedule_epoch:
                 self.scheduler.step()
-            self.train_progress['1mod'][-1].append(float(loss_atac))
+            elif self.epoch == self.max_schedule_epoch:
+                self.lr = 3e-4
+                self.optim = self.configure_optimizers()
             self.train_progress['2mod'][-1].append(float(loss_rna))
             self.train_progress['2mod_cor'][-1].append(float(cor))
             if self.use_tensor_board:
-                n_iter = self.epoch * len(self.train_loader) + self.train_batch_idx
-                self.writer.add_scalar('train 1 mod loss', loss_atac, n_iter)
+                n_iter = self.epoch * self.train_loader.nb_batches + self.train_batch_idx
                 self.writer.add_scalar('train 2 mod loss', loss_rna, n_iter)
                 self.writer.add_scalar('train 2 mod cor', cor, n_iter)  
             self.train_batch_idx += 1
             
-        mean_atac_loss = np.mean(self.train_progress['1mod'][-1])
         mean_rna_loss= np.mean(self.train_progress['2mod'][-1])
         if self.calculate_cor:
             mean_cor = np.mean(self.train_progress['2mod_cor'][-1])
         
         if not self.use_tensor_board:
             print(f'EPOCH {self.epoch}')
-            print('Train 1 modality loss:', mean_atac_loss)
             print('Train 2 modality loss:', mean_rna_loss)
             if self.calculate_cor:
                 print('Train 2 modality cor:', mean_cor)
@@ -310,121 +265,136 @@ class Trainer(HyperParameters):
         if self.do_validation:
             with torch.no_grad():
                 self.model.eval()
-                self.val_progress['1mod'].append([])
                 self.val_progress['2mod'].append([])
                 self.val_progress['2mod_cor'].append([])
                 for batch_inputs, batch_targets in self.val_loader:
+                    batch_inputs, batch_targets = batch_inputs.to(self.device), batch_targets.to(self.device)
                     loss_atac, loss_rna, cor = self.model.validation_step(batch_inputs, batch_targets, calculate_cor)
-                    self.val_progress['1mod'][-1].append(float(loss_atac))
                     self.val_progress['2mod'][-1].append(float(loss_rna))
                     self.val_progress['2mod_cor'][-1].append(float(cor))
                     if self.use_tensor_board:
-                        n_iter = self.epoch * len(self.val_loader) + self.val_batch_idx
-                        self.writer.add_scalar('val 1 mod loss', loss_atac, n_iter)
+                        n_iter = self.epoch * self.val_loader.nb_batches + self.val_batch_idx
                         self.writer.add_scalar('val 2 mod loss', loss_rna, n_iter)
                         self.writer.add_scalar('val 2 mod cor', cor, n_iter)  
 
                     self.val_batch_idx += 1
 
-                mean_atac_loss = np.mean(self.val_progress['1mod'][-1])
                 mean_rna_loss= np.mean(self.val_progress['2mod'][-1])
                 if self.calculate_cor:
                     mean_cor = np.mean(self.val_progress['2mod_cor'][-1])
 
                 if not self.use_tensor_board:
-                    print('Validation 1 modality loss:', mean_atac_loss)
                     print('Validation 2 modality loss:', mean_rna_loss)
                     if self.calculate_cor:
                         print('Validation 2 modality cor:', mean_cor)
                     print('\n')
         
         
-    def test_model(self, test_fn):
-        self.test_fn = test_fn
-        self.test_loader = self.load_data('test')
+    def transform(self, test_loader):
+        self.test_loader = test_loader
         self.test_batch_idx = 0
         self.model.eval()
         outputs = []
-        for batch_inputs, batch_targets in self.test_loader:
-            batch_outputs = self.model(batch_inputs)[1]
+        for batch_inputs in self.test_loader:
+            batch_inputs = batch_inputs.to(self.device)
+            batch_outputs = self.model.predict(batch_inputs)
             outputs.append(batch_outputs.to('cpu').detach().numpy())
         return np.concatenate(outputs)
             
             
-    def load_model(self, model, file='trained_model.pt', model_params={}):
-        self.model_params = model_params
-        self.model = self.prepare_model(model)
+    def load_model(self, file='trained_model.pt'):
+        self.prepare_model()
         self.model.load_state_dict(torch.load(file))
         
     def save_model(self, file='trained_model.pt'):
         torch.save(self.model.state_dict(), file)
     
-    def analyze_model(self, model, dset='train'):    
-        if dset=='train':
-            loader = self.train_loader
-        elif dset=='val':
-            loader = self.val_loader
-        else:
-            self.test_loader = self.load_data('test')
+    def analyze_model(self, loader):    
         self.model.eval()
-        atac_pred = []
         rna_pred = []
-        atac_orig = []
         rna_orig = []
         for batch_inputs, batch_targets  in loader:
-            atac_recon, rna_recon = self.model.predict(batch_inputs)
-            atac_pred.append(atac_recon.to('cpu'))
+            batch_inputs = batch_inputs.to(self.device)
+            rna_recon = self.model.predict(batch_inputs)
             rna_pred.append(rna_recon.to('cpu'))
-            atac_orig.append(batch_inputs.to('cpu'))
-            rna_orig.append(batch_targets.to('cpu'))
+            rna_orig.append(batch_targets)
             
-        atac_pred = torch.cat(atac_pred).detach().numpy()
-        rna_pred = torch.cat(rna_pred).detach().numpy()
-        atac_orig = torch.cat(atac_orig).detach().numpy()
+        rna_pred = torch.cat(rna_pred).detach().numpy()   
         rna_orig = torch.cat(rna_orig).detach().numpy()
+        return rna_pred, rna_orig
+
+class Dataset(torch.utils.data.Dataset, HyperParameters):
+    def __init__(self, inputs, targets):
+        self.save_hyperparameters()
+
+    def __len__(self):
+        return len(self.inputs)
+
+    def __getitem__(self, index):
+        return self.inputs[index], self.targets[index]
+
+
+def make_loaders(
+              inputs,
+              targets = None,
+              batch_size: int = 2048,
+              subset_train=-1,
+              val_size = 2048*4,
+              num_workers = 10
+              ):
+
+    if targets is not None:
+    
+        idx = np.arange(targets.shape[0])
+        val_idx = np.random.choice(idx, val_size, replace=False)
+        train_idx = idx[~np.isin(idx, val_idx)]
+
+        if subset_train > 0:
+            train_idx = np.random.choice(train_idx, subset_train, replace=False)
+
+        nb_batches = len(train_idx) // batch_size
+        input_dim = inputs.shape[1]
+        output_dim = targets.shape[1]
         
-        return atac_pred, rna_pred, atac_orig, rna_orig
+        train_loader = DataLoader(Dataset(inputs[train_idx], targets[train_idx]),
+                   shuffle=True, drop_last=True, num_workers=num_workers, batch_size=batch_size)
+        train_loader.nb_batches = nb_batches
+        train_loader.input_dim = input_dim
+        train_loader.output_dim = output_dim
+   
+        
+        nb_batches = len(val_idx) // batch_size
+        val_loader = DataLoader(Dataset(inputs[val_idx], targets[val_idx]),
+                  shuffle=True, drop_last=True, num_workers=num_workers, batch_size=batch_size)
+        val_loader.nb_batches = nb_batches
+        val_loader.input_dim = input_dim
+        val_loader.output_dim = output_dim
+        return train_loader, val_loader
+    
+    else:
+        nb_batches = len(inputs) // batch_size
+        loader = DataLoader(inputs, batch_size=batch_size, 
+                            shuffle=False, drop_last=False,
+                            num_workers=num_workers)
+        loader.nb_batches = nb_batches
+        return loader
 
-    def load_data(self,
-                  dset: str = 'train',
-                  cv_split: bool = True,
-                  batch_size: int = 2048,
-                  subset_train=-1,
-                  val_size = 2048*4
-                  ):
-        if dset == 'train':
-            inputs_fn = self.inputs_fn
-            targets_fn = self.targets_fn
-        elif dset == 'test':
-            inputs_fn = self.test_fn
-            targets_fn = self.test_fn
-        inputs = sparse.load_npz(inputs_fn)
-        targets = sparse.load_npz(targets_fn)
+def load_sparse_data(file):
+    data = torch.Tensor(sparse.load_npz(file).todense())
+    return data
 
-        if cv_split and dset == 'train':
-            idx = np.arange(targets.shape[0])
-            val_idx = np.random.choice(idx, val_size, replace=False)
-            train_idx = idx[~np.isin(idx, val_idx)]
-            
-            if subset_train > 0:
-                train_idx = np.random.choice(train_idx, subset_train, replace=False)
-            
-            train_loader = DataLoader(inputs, targets, 
-                                         train_idx=train_idx,
-                                         batch_size=batch_size,
-                                         drop_last=True,
-                                         shuffle=True,
-                                         device=self.device)
-            val_loader = DataLoader(inputs, targets,
-                                       train_idx=val_idx,
-                                       batch_size=batch_size,
-                                       drop_last=True,
-                                       shuffle=True,
-                                       device=self.device)
-            return train_loader, val_loader
-        else:
-            loader = DataLoader(inputs, targets, 
-                                         batch_size=batch_size,
-                                         drop_last=False,
-                                         device=self.device)
-            return loader
+class GaussianHistogram(nn.Module):
+    def __init__(self, bins, min, max, sigma):
+        super(GaussianHistogram, self).__init__()
+        self.bins = bins
+        self.min = min
+        self.max = max
+        self.sigma = sigma
+        self.delta = float(max - min) / float(bins)
+        self.centers = float(min) + self.delta * (torch.arange(bins, device='cuda:0').float() + 0.5)
+
+    def forward(self, x):
+        x = torch.unsqueeze(x, 0) - torch.unsqueeze(self.centers, 1)
+        x = torch.exp(-0.5*(x/self.sigma)**2) / (self.sigma * np.sqrt(np.pi*2)) * self.delta
+        x = x.sum(dim=1)
+        return x
