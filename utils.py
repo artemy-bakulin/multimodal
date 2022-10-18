@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import inspect
 from torch.utils.data import DataLoader
+from torch.optim.swa_utils import SWALR
 
 
 # https://d2l.ai/_modules/d2l/torch.html
@@ -148,9 +149,12 @@ class Trainer(HyperParameters):
     def __init__(self,
                  atac_w: float = 0.5,
                  lr: float = 0.01, 
+                 min_lr: float = 1e-4,
                  max_epochs: int = 1000,
                  wd: float = 1e-2,
-                 use_schedule: bool = True,
+                 use_one_cycle: bool = True,
+                 use_swa: bool = False,
+                 swa_start: int = 5,
                  inputs_fn: str = None,
                  targets_fn: str = None,
                  device: str = 'cuda',
@@ -205,7 +209,7 @@ class Trainer(HyperParameters):
         self.model_params['output_dim'] = self.train_loader.output_dim
         self.prepare_model()
         self.optim = self.configure_optimizers()
-        if self.use_schedule:
+        if self.use_one_cycle:
             self.scheduler = self.configure_scheduler()
         self.epoch = 0
         if self.use_tensor_board:
@@ -214,13 +218,13 @@ class Trainer(HyperParameters):
         self.calculate_cor = calculate_cor
         self.train_progress = {'2mod': [], '2mod_cor': []}
         self.val_progress = {'2mod': [], '2mod_cor': []}
-        #self.reduce_lr_on_plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optim)
+        if self.use_swa:
+            self.schedule_swa = SWALR(self.optim, swa_lr=self.lr)
         for self.epoch in tqdm(range(self.max_epochs)):
             self.train_batch_idx = 0
             self.val_batch_idx = 0
             self.fit_epoch()
             self.epoch += 1 
-            #self.reduce_lr_on_plateau_scheduler.step(np.mean(self.val_progress['2mod'][-1]))
         print('Training loss: %.3f' % np.mean(self.train_progress['2mod'][-1]),
               'Training cor: %.3f' % np.mean(self.train_progress['2mod_cor'][-1]),
               'Validation loss: %.3f' % np.mean(self.val_progress['2mod'][-1]),
@@ -237,11 +241,13 @@ class Trainer(HyperParameters):
             self.optim.zero_grad()
             loss.backward()
             self.optim.step()
-            if self.use_schedule and self.epoch < self.max_schedule_epoch:
+            if self.epoch < self.max_schedule_epoch and self.use_one_cycle:
                 self.scheduler.step()
-            elif self.epoch == self.max_schedule_epoch:
-                self.lr = 3e-4
+            elif self.epoch == self.max_schedule_epoch and self.use_one_cycle:
+                self.lr = self.min_lr
                 self.optim = self.configure_optimizers()
+            if self.use_swa and self.epoch>self.swa_start:
+                self.schedule_swa.step()
             self.train_progress['2mod'][-1].append(float(loss_rna))
             self.train_progress['2mod_cor'][-1].append(float(cor))
             if self.use_tensor_board:
