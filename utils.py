@@ -161,7 +161,10 @@ class Trainer(HyperParameters):
                  writer = None,
                  l1_weight = 0,
                  l2_weight = 0,
-                 max_schedule_epoch = None
+                 sparsity_beta = 0,
+                 sparsity_rho = 0,
+                 max_schedule_epoch = None,
+                 model_params = {}
                  ):
         self.save_hyperparameters()
         self.use_tensor_board = True if writer is not None else False
@@ -187,7 +190,10 @@ class Trainer(HyperParameters):
 
     def add_model(self, model, model_params={}):
         self.model_template = model
-        self.model_params = model_params
+        self.model_params = {**self.model_params,
+                             ** model_params,
+                             **{'sparsity_beta': self.sparsity_beta,
+                                'sparsity_rho': self.sparsity_rho}}
     
     def prepare_model(self):
         self.model = self.model_template(**self.model_params)
@@ -236,8 +242,10 @@ class Trainer(HyperParameters):
         self.train_progress['2mod_cor'].append([])
         for batch_inputs, batch_targets in self.train_loader:
             batch_inputs, batch_targets = batch_inputs.to(self.device), batch_targets.to(self.device)
-            loss_atac, loss_rna, cor = self.model.training_step(batch_inputs, batch_targets, calculate_cor)
-            loss = loss_rna + self.calculate_l1_norm() * self.l1_weight  + self.calculate_l2_norm() * self.l2_weight
+            loss_rna, cor = self.model.training_step(batch_inputs, batch_targets, calculate_cor)
+            l1_norm = self.calculate_l1_norm() * self.l1_weight if self.l1_weight else 0
+            l2_norm = self.calculate_l2_norm() * self.l2_weight if self.l2_weight else 0
+            loss = loss_rna + l1_norm + l2_norm
             self.optim.zero_grad()
             loss.backward()
             self.optim.step()
@@ -275,7 +283,7 @@ class Trainer(HyperParameters):
                 self.val_progress['2mod_cor'].append([])
                 for batch_inputs, batch_targets in self.val_loader:
                     batch_inputs, batch_targets = batch_inputs.to(self.device), batch_targets.to(self.device)
-                    loss_atac, loss_rna, cor = self.model.validation_step(batch_inputs, batch_targets, calculate_cor)
+                    loss_rna, cor = self.model.validation_step(batch_inputs, batch_targets, calculate_cor)
                     self.val_progress['2mod'][-1].append(float(loss_rna))
                     self.val_progress['2mod_cor'][-1].append(float(cor))
                     if self.use_tensor_board:
@@ -404,3 +412,86 @@ class GaussianHistogram(nn.Module):
         x = torch.exp(-0.5*(x/self.sigma)**2) / (self.sigma * np.sqrt(np.pi*2)) * self.delta
         x = x.sum(dim=1)
         return x
+    
+
+class CustomModel(nn.Module, HyperParameters):
+    def dist_loss(self, y, y_hat):
+        gausshist = GaussianHistogram(bins=20, min=5, max=25, sigma=6)
+        dist1 = gausshist(y.flatten())[1:]
+        dist2 = gausshist(y_hat.flatten())[1:]
+        dist1 += 1
+        dist2 += 1
+        dist1 /= torch.sum(dist1)
+        dist2 /= torch.sum(dist2)
+        l = nn.KLDivLoss(reduction="batchmean", log_target=True)(torch.log(dist1), torch.log(dist2))
+        return l
+    
+    def MSE_loss(self, y, y_hat):
+        l = nn.MSELoss()(y_hat, y)
+        return l
+    
+    def masked_loss(self, y, y_hat):
+        mask = (y_hat<-0.1) | (y_hat>1)
+        l = nn.MSELoss()(y_hat[mask], y[mask]) / (torch.sum(mask) + 1) * 0.999
+        l += nn.MSELoss()(y_hat[~mask], y[~mask]) / (torch.sum(~mask) + 1) * 0.001
+        return l
+    
+    def cor_loss(self, y, y_hat):
+        r = torch.corrcoef(torch.stack((y.flatten(), y_hat.flatten())))[0, 1]
+        return -r
+    
+    def loss(self, y, y_hat):
+        l = 0
+        l += self.MSE_loss(y, y_hat)
+        return l
+    
+    def kl_divergence(self, rho, rho_hat):
+        rho_hat = torch.mean(torch.sigmoid(rho_hat), 1) # sigmoid because we need the probability distributions
+        rho = torch.tensor([rho] * len(rho_hat)).to(device)
+        return torch.sum(rho * torch.log(rho/rho_hat) + (1 - rho) * torch.log((1 - rho)/(1 - rho_hat)))
+    
+
+    def training_step(self, inputs, targets, calculate_cor=True):
+        rna_recon = self.forward(inputs)
+        loss = self.loss(rna_recon, targets)
+        
+        if calculate_cor:
+            cor = spearman_cor(rna_recon, targets)
+        else:
+            cor=0
+        return loss, cor
+    
+    def validation_step(self, inputs, targets, calculate_cor=True):
+        rna_recon = self.forward(inputs)
+        loss = self.loss(rna_recon, targets)
+        
+        if calculate_cor:
+            cor = spearman_cor(rna_recon, targets)
+        else:
+            cor=0
+        return loss, cor
+    
+    def predict(self, inputs):
+        rna_recon = self.forward(inputs)
+        return rna_recon
+    
+
+def init_weights(m, activation='silu'):
+    if isinstance(m, nn.BatchNorm1d):
+        nn.init.constant_(m.weight.data, 1)
+        nn.init.constant_(m.bias.data, 0)
+    
+    if activation == 'silu':
+        if isinstance(m, nn.Conv1d):
+            n = m.kernel_size[0] * m.out_channels
+            m.weight.data.normal_(0, math.sqrt(2 / n))
+            if m.bias is not None:
+                nn.init.constant_(m.bias.data, 0)
+        elif isinstance(m, nn.Linear):
+            m.weight.data.normal_(0, 0.001)
+            if m.bias is not None:
+                nn.init.constant_(m.bias.data, 0) 
+    else:
+        if isinstance(m, nn.Linear):
+            torch.nn.init.kaiming_uniform_(m.weight)
+            m.bias.data.fill_(0.01) 
