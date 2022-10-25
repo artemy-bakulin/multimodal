@@ -8,6 +8,7 @@ from tqdm import tqdm
 import inspect
 from torch.utils.data import DataLoader
 from torch.optim.swa_utils import SWALR
+from torch.optim.swa_utils import AveragedModel
 
 
 # https://d2l.ai/_modules/d2l/torch.html
@@ -143,9 +144,48 @@ def plot_model_analysis(rna_pred, rna_orig):
     axs[1].set_title('Zeros in RNA data')
     axs[1].set_ylabel('Zeros in sample')
     plt.show()
-
-
-class Trainer(HyperParameters):
+    
+class Losses:
+    def dist_loss(self, y, y_hat):
+        gausshist = GaussianHistogram(bins=20, min=5, max=25, sigma=6)
+        dist1 = gausshist(y.flatten())[1:]
+        dist2 = gausshist(y_hat.flatten())[1:]
+        dist1 += 1
+        dist2 += 1
+        dist1 /= torch.sum(dist1)
+        dist2 /= torch.sum(dist2)
+        l = nn.KLDivLoss(reduction="batchmean", log_target=True)(torch.log(dist1), torch.log(dist2))
+        return l
+    
+    def MSE_loss(self, y, y_hat):
+        l = nn.MSELoss()(y_hat, y)
+        return l
+    
+    def masked_loss(self, y, y_hat):
+        mask = (y_hat<-0.1) | (y_hat>1)
+        l = nn.MSELoss()(y_hat[mask], y[mask]) / (torch.sum(mask) + 1) * 0.999
+        l += nn.MSELoss()(y_hat[~mask], y[~mask]) / (torch.sum(~mask) + 1) * 0.001
+        return l
+    
+    def cor_loss(self, y, y_hat):
+        r = torch.corrcoef(torch.stack((y.flatten(), y_hat.flatten())))[0, 1]
+        return -r
+    
+    def calculate_l1_norm(self):
+        l1_norm = sum([torch.abs(p).sum() for p in self.model.parameters()])
+        return l1_norm
+    
+    def calculate_l2_norm(self):
+        l2_norm = sum([torch.pow(p, 2).sum() for p in self.model.parameters()])
+        return l2_norm
+    
+    def kl_divergence(self, rho, rho_hat):
+        rho_hat = torch.mean(torch.sigmoid(rho_hat), 1) # sigmoid because we need the probability distributions
+        rho = torch.tensor([rho] * len(rho_hat)).to(self.device)
+        return torch.sum(rho * torch.log(rho/rho_hat) + (1 - rho) * torch.log((1 - rho)/(1 - rho_hat)))
+    
+    
+class Trainer(HyperParameters, Losses):
     def __init__(self,
                  atac_w: float = 0.5,
                  lr: float = 0.01, 
@@ -154,6 +194,7 @@ class Trainer(HyperParameters):
                  wd: float = 1e-2,
                  use_one_cycle: bool = True,
                  use_swa: bool = False,
+                 swa_lr = 1e-3,
                  swa_start: int = 5,
                  inputs_fn: str = None,
                  targets_fn: str = None,
@@ -169,21 +210,6 @@ class Trainer(HyperParameters):
         self.save_hyperparameters()
         self.use_tensor_board = True if writer is not None else False
         self.max_schedule_epoch = self.max_epochs if self.max_schedule_epoch is None else self.max_schedule_epoch
-
-    
-    def calculate_l1_norm(self):
-        l1_norm = sum([torch.abs(p).sum() for p in self.model.parameters()])
-        return l1_norm
-    
-    def calculate_l2_norm(self):
-        l2_norm = sum([torch.pow(p, 2).sum() for p in self.model.parameters()])
-        return l2_norm
-    
-    def kl_divergence(self, rho, rho_hat):
-        rho_hat = torch.mean(torch.sigmoid(rho_hat), 1) # sigmoid because we need the probability distributions
-        rho = torch.tensor([rho] * len(rho_hat)).to(self.device)
-        return torch.sum(rho * torch.log(rho/rho_hat) + (1 - rho) * torch.log((1 - rho)/(1 - rho_hat)))
-    
 
     
     def configure_optimizers(self):
@@ -232,27 +258,32 @@ class Trainer(HyperParameters):
         self.train_progress = {'2mod': [], '2mod_cor': []}
         self.val_progress = {'2mod': [], '2mod_cor': []}
         if self.use_swa:
-            self.schedule_swa = SWALR(self.optim, swa_lr=self.lr)
+            self.swa_model = AveragedModel(self.model)
+            self.schedule_swa = SWALR(self.optim, swa_lr=self.swa_lr)
         for self.epoch in tqdm(range(self.max_epochs)):
             self.train_batch_idx = 0
             self.val_batch_idx = 0
             self.fit_epoch()
-            self.epoch += 1 
+            self.epoch += 1
+        if self.use_swa:
+            self.model = self.swa_model
         if self.verbose:
             print('Training loss: %.3f' % np.mean(self.train_progress['2mod'][-1]),
                   'Training cor: %.3f' % np.mean(self.train_progress['2mod_cor'][-1]),
                   'Validation loss: %.3f' % np.mean(self.val_progress['2mod'][-1]),
                   'Validation cor: %.3f' % np.mean(self.val_progress['2mod_cor'][-1]), sep='\n')
         if return_val_loss:
-            return self.val_progress['2mod'][-1], self.val_progress['2mod_cor'][-1]
+            return np.mean(self.val_progress['2mod'][-1]), np.mean(self.val_progress['2mod_cor'][-1])
             
-    def fit_epoch(self, calculate_cor=True):
+    def fit_epoch(self):
         self.model.train()
         self.train_progress['2mod'].append([])
         self.train_progress['2mod_cor'].append([])
         for batch_inputs, batch_targets in self.train_loader:
             batch_inputs, batch_targets = batch_inputs.to(self.device), batch_targets.to(self.device)
-            loss_rna, cor = self.model.training_step(batch_inputs, batch_targets, calculate_cor)
+            targets_pred = self.model.forward(batch_inputs)
+            loss_rna = self.MSE_loss(targets_pred, batch_targets)
+            cor = spearman_cor(targets_pred, batch_targets)           
             l1_norm = self.calculate_l1_norm() * self.l1_weight 
             l2_norm = self.calculate_l2_norm() * self.l2_weight 
             sparsity_loss = self.kl_divergence(self.sparsity_rho, batch_targets) * self.sparsity_beta
@@ -260,13 +291,13 @@ class Trainer(HyperParameters):
             self.optim.zero_grad()
             loss.backward()
             self.optim.step()
+                
             if self.epoch < self.max_schedule_epoch and self.use_one_cycle:
                 self.scheduler.step()
             elif self.epoch == self.max_schedule_epoch and self.use_one_cycle:
                 self.lr = self.min_lr
                 self.optim = self.configure_optimizers()
-            if self.use_swa and self.epoch>self.swa_start:
-                self.schedule_swa.step()
+            
             self.train_progress['2mod'][-1].append(float(loss_rna))
             self.train_progress['2mod_cor'][-1].append(float(cor))
             if self.use_tensor_board:
@@ -285,7 +316,16 @@ class Trainer(HyperParameters):
             if self.calculate_cor:
                 print('Train 2 modality cor:', mean_cor)
             print('\n')
+            
+            
+        if self.use_swa and self.epoch > self.swa_start:
+            self.swa_model.update_parameters(self.model)
+            self.schedule_swa.step()
         
+        if self.use_swa and self.epoch == self.max_epochs - 1:
+            torch.optim.swa_utils.update_bn(self.train_loader, self.swa_model.to('cpu'))
+            self.swa_model = self.swa_model.to(self.device)
+            self.model = self.swa_model
         
         if self.do_validation:
             with torch.no_grad():
@@ -294,7 +334,11 @@ class Trainer(HyperParameters):
                 self.val_progress['2mod_cor'].append([])
                 for batch_inputs, batch_targets in self.val_loader:
                     batch_inputs, batch_targets = batch_inputs.to(self.device), batch_targets.to(self.device)
-                    loss_rna, cor = self.model.validation_step(batch_inputs, batch_targets, calculate_cor)
+
+                    targets_pred = self.model.forward(batch_inputs)
+                    loss_rna = self.MSE_loss(targets_pred, batch_targets)
+                    cor = spearman_cor(targets_pred, batch_targets)
+                    
                     self.val_progress['2mod'][-1].append(float(loss_rna))
                     self.val_progress['2mod_cor'][-1].append(float(cor))
                     if self.use_tensor_board:
@@ -322,13 +366,15 @@ class Trainer(HyperParameters):
         outputs = []
         for batch_inputs in self.test_loader:
             batch_inputs = batch_inputs.to(self.device)
-            batch_outputs = self.model.predict(batch_inputs)
+            batch_outputs = self.model.forward(batch_inputs)
             outputs.append(batch_outputs.to('cpu').detach().numpy())
         return np.concatenate(outputs)
             
             
     def load_model(self, file='trained_model.pt'):
         self.prepare_model()
+        if self.use_swa:
+            self.model = AveragedModel(self.model)
         self.model.load_state_dict(torch.load(file))
         
     def save_model(self, file='trained_model.pt'):
@@ -340,7 +386,7 @@ class Trainer(HyperParameters):
         rna_orig = []
         for batch_inputs, batch_targets  in loader:
             batch_inputs = batch_inputs.to(self.device)
-            rna_recon = self.model.predict(batch_inputs)
+            rna_recon = self.model.forward(batch_inputs)
             rna_pred.append(rna_recon.to('cpu'))
             rna_orig.append(batch_targets)
             
@@ -425,62 +471,6 @@ class GaussianHistogram(nn.Module):
         x = torch.exp(-0.5*(x/self.sigma)**2) / (self.sigma * np.sqrt(np.pi*2)) * self.delta
         x = x.sum(dim=1)
         return x
-    
-
-class CustomModel(nn.Module, HyperParameters):
-    def dist_loss(self, y, y_hat):
-        gausshist = GaussianHistogram(bins=20, min=5, max=25, sigma=6)
-        dist1 = gausshist(y.flatten())[1:]
-        dist2 = gausshist(y_hat.flatten())[1:]
-        dist1 += 1
-        dist2 += 1
-        dist1 /= torch.sum(dist1)
-        dist2 /= torch.sum(dist2)
-        l = nn.KLDivLoss(reduction="batchmean", log_target=True)(torch.log(dist1), torch.log(dist2))
-        return l
-    
-    def MSE_loss(self, y, y_hat):
-        l = nn.MSELoss()(y_hat, y)
-        return l
-    
-    def masked_loss(self, y, y_hat):
-        mask = (y_hat<-0.1) | (y_hat>1)
-        l = nn.MSELoss()(y_hat[mask], y[mask]) / (torch.sum(mask) + 1) * 0.999
-        l += nn.MSELoss()(y_hat[~mask], y[~mask]) / (torch.sum(~mask) + 1) * 0.001
-        return l
-    
-    def cor_loss(self, y, y_hat):
-        r = torch.corrcoef(torch.stack((y.flatten(), y_hat.flatten())))[0, 1]
-        return -r
-    
-    def loss(self, y, y_hat):
-        l = 0
-        l += self.MSE_loss(y, y_hat)
-        return l
-    
-    def training_step(self, inputs, targets, calculate_cor=True):
-        rna_recon = self.forward(inputs)
-        loss = self.loss(rna_recon, targets)
-        
-        if calculate_cor:
-            cor = spearman_cor(rna_recon, targets)
-        else:
-            cor=0
-        return loss, cor
-    
-    def validation_step(self, inputs, targets, calculate_cor=True):
-        rna_recon = self.forward(inputs)
-        loss = self.loss(rna_recon, targets)
-        
-        if calculate_cor:
-            cor = spearman_cor(rna_recon, targets)
-        else:
-            cor=0
-        return loss, cor
-    
-    def predict(self, inputs):
-        rna_recon = self.forward(inputs)
-        return rna_recon
     
 
 def init_weights(m, activation='silu'):
