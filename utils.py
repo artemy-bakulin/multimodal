@@ -179,6 +179,13 @@ class Trainer(HyperParameters):
         l2_norm = sum([torch.pow(p, 2).sum() for p in self.model.parameters()])
         return l2_norm
     
+    def kl_divergence(self, rho, rho_hat):
+        rho_hat = torch.mean(torch.sigmoid(rho_hat), 1) # sigmoid because we need the probability distributions
+        rho = torch.tensor([rho] * len(rho_hat)).to(self.device)
+        return torch.sum(rho * torch.log(rho/rho_hat) + (1 - rho) * torch.log((1 - rho)/(1 - rho_hat)))
+    
+
+    
     def configure_optimizers(self):
         return torch.optim.AdamW(self.model.parameters(), self.lr, weight_decay=self.wd)
     
@@ -191,9 +198,8 @@ class Trainer(HyperParameters):
     def add_model(self, model, model_params={}):
         self.model_template = model
         self.model_params = {**self.model_params,
-                             ** model_params,
-                             **{'sparsity_beta': self.sparsity_beta,
-                                'sparsity_rho': self.sparsity_rho}}
+                             **model_params,
+                             **{'device': self.device}}
     
     def prepare_model(self):
         self.model = self.model_template(**self.model_params)
@@ -209,7 +215,8 @@ class Trainer(HyperParameters):
     def add_val_loader(self, val_loader):
         self.val_loader = val_loader
     
-    def fit(self, do_validation=True, calculate_cor=True, subset_train=-1):
+    def fit(self, do_validation=True, calculate_cor=True, subset_train=-1, return_val_loss=False, verbose=True):
+        self.verbose = verbose
         self.steps_per_epoch = self.train_loader.nb_batches
         self.model_params['input_dim'] = self.train_loader.input_dim
         self.model_params['output_dim'] = self.train_loader.output_dim
@@ -231,10 +238,13 @@ class Trainer(HyperParameters):
             self.val_batch_idx = 0
             self.fit_epoch()
             self.epoch += 1 
-        print('Training loss: %.3f' % np.mean(self.train_progress['2mod'][-1]),
-              'Training cor: %.3f' % np.mean(self.train_progress['2mod_cor'][-1]),
-              'Validation loss: %.3f' % np.mean(self.val_progress['2mod'][-1]),
-              'Validation cor: %.3f' % np.mean(self.val_progress['2mod_cor'][-1]), sep='\n')
+        if self.verbose:
+            print('Training loss: %.3f' % np.mean(self.train_progress['2mod'][-1]),
+                  'Training cor: %.3f' % np.mean(self.train_progress['2mod_cor'][-1]),
+                  'Validation loss: %.3f' % np.mean(self.val_progress['2mod'][-1]),
+                  'Validation cor: %.3f' % np.mean(self.val_progress['2mod_cor'][-1]), sep='\n')
+        if return_val_loss:
+            return self.val_progress['2mod'][-1], self.val_progress['2mod_cor'][-1]
             
     def fit_epoch(self, calculate_cor=True):
         self.model.train()
@@ -243,9 +253,10 @@ class Trainer(HyperParameters):
         for batch_inputs, batch_targets in self.train_loader:
             batch_inputs, batch_targets = batch_inputs.to(self.device), batch_targets.to(self.device)
             loss_rna, cor = self.model.training_step(batch_inputs, batch_targets, calculate_cor)
-            l1_norm = self.calculate_l1_norm() * self.l1_weight if self.l1_weight else 0
-            l2_norm = self.calculate_l2_norm() * self.l2_weight if self.l2_weight else 0
-            loss = loss_rna + l1_norm + l2_norm
+            l1_norm = self.calculate_l1_norm() * self.l1_weight 
+            l2_norm = self.calculate_l2_norm() * self.l2_weight 
+            sparsity_loss = self.kl_divergence(self.sparsity_rho, batch_targets) * self.sparsity_beta
+            loss = loss_rna + l1_norm + l2_norm + sparsity_loss
             self.optim.zero_grad()
             loss.backward()
             self.optim.step()
@@ -268,7 +279,7 @@ class Trainer(HyperParameters):
         if self.calculate_cor:
             mean_cor = np.mean(self.train_progress['2mod_cor'][-1])
         
-        if not self.use_tensor_board:
+        if not self.use_tensor_board and self.verbose:
             print(f'EPOCH {self.epoch}')
             print('Train 2 modality loss:', mean_rna_loss)
             if self.calculate_cor:
@@ -297,7 +308,7 @@ class Trainer(HyperParameters):
                 if self.calculate_cor:
                     mean_cor = np.mean(self.val_progress['2mod_cor'][-1])
 
-                if not self.use_tensor_board:
+                if not self.use_tensor_board and self.verbose:
                     print('Validation 2 modality loss:', mean_rna_loss)
                     if self.calculate_cor:
                         print('Validation 2 modality cor:', mean_cor)
@@ -354,13 +365,15 @@ def make_loaders(
               batch_size: int = 2048,
               subset_train=-1,
               val_size = 2048*4,
-              num_workers = 10
+              num_workers = 10,
+              val_idx = None
               ):
 
     if targets is not None:
     
         idx = np.arange(targets.shape[0])
-        val_idx = np.random.choice(idx, val_size, replace=False)
+        if val_idx is None:
+            val_idx = np.random.choice(idx, val_size, replace=False)
         train_idx = idx[~np.isin(idx, val_idx)]
 
         if subset_train > 0:
@@ -394,7 +407,7 @@ def make_loaders(
         return loader
 
 def load_sparse_data(file):
-    data = torch.Tensor(sparse.load_npz(file).todense())
+    data = np.asarray(sparse.load_npz(file).todense()).astype(np.float32)
     return data
 
 class GaussianHistogram(nn.Module):
@@ -445,12 +458,6 @@ class CustomModel(nn.Module, HyperParameters):
         l += self.MSE_loss(y, y_hat)
         return l
     
-    def kl_divergence(self, rho, rho_hat):
-        rho_hat = torch.mean(torch.sigmoid(rho_hat), 1) # sigmoid because we need the probability distributions
-        rho = torch.tensor([rho] * len(rho_hat)).to(device)
-        return torch.sum(rho * torch.log(rho/rho_hat) + (1 - rho) * torch.log((1 - rho)/(1 - rho_hat)))
-    
-
     def training_step(self, inputs, targets, calculate_cor=True):
         rna_recon = self.forward(inputs)
         loss = self.loss(rna_recon, targets)
